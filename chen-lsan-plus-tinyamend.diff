@@ -1,0 +1,487 @@
+diff --git a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h
+index 776ca60b1e9..219b98013dc 100644
+--- a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h
++++ b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h
+@@ -43,7 +43,7 @@
+ #define CAN_SANITIZE_LEAKS 1
+ #elif SANITIZER_RISCV64 && SANITIZER_LINUX
+ #define CAN_SANITIZE_LEAKS 1
+-#elif SANITIZER_NETBSD || SANITIZER_FUCHSIA
++#elif SANITIZER_NETBSD || SANITIZER_FREEBSD || SANITIZER_FUCHSIA
+ #define CAN_SANITIZE_LEAKS 1
+ #else
+ #define CAN_SANITIZE_LEAKS 0
+diff --git a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp
+index 3af586e220f..bcc42f81c33 100644
+--- a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp
++++ b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp
+@@ -15,7 +15,7 @@
+ #include "sanitizer_common/sanitizer_platform.h"
+ #include "lsan_common.h"
+ 
+-#if CAN_SANITIZE_LEAKS && (SANITIZER_LINUX || SANITIZER_NETBSD)
++#if CAN_SANITIZE_LEAKS && (SANITIZER_LINUX || SANITIZER_NETBSD || SANITIZER_FREEBSD)
+ #include <link.h>
+ 
+ #include "sanitizer_common/sanitizer_common.h"
+@@ -80,7 +80,11 @@ static int ProcessGlobalRegionsCallback(struct dl_phdr_info *info, size_t size,
+                                         void *data) {
+   Frontier *frontier = reinterpret_cast<Frontier *>(data);
+   for (uptr j = 0; j < info->dlpi_phnum; j++) {
++#if SANITIZER_FREEBSD
++    const __ElfN(Phdr) *phdr = &(info->dlpi_phdr[j]);
++#else
+     const ElfW(Phdr) *phdr = &(info->dlpi_phdr[j]);
++#endif
+     // We're looking for .data and .bss sections, which reside in writeable,
+     // loadable segments.
+     if (!(phdr->p_flags & PF_W) || (phdr->p_type != PT_LOAD) ||
+@@ -142,7 +146,12 @@ static int LockStuffAndStopTheWorldCallback(struct dl_phdr_info *info,
+ void LockStuffAndStopTheWorld(StopTheWorldCallback callback,
+                               CheckForLeaksParam *argument) {
+   DoStopTheWorldParam param = {callback, argument};
++#if SANITIZER_FREEBSD
++  // The tracer is a separate process, phdr deadlock is not a concern
++  LockStuffAndStopTheWorldCallback(0, 0, &param);
++#else
+   dl_iterate_phdr(LockStuffAndStopTheWorldCallback, &param);
++#endif
+ }
+ 
+ } // namespace __lsan
+diff --git a/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp b/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
+new file mode 100644
+index 00000000000..f6a7452b10d
+--- /dev/null
++++ b/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
+@@ -0,0 +1,289 @@
++//===-- sanitizer_stoptheworld_linux_libcdep.cc ---------------------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// See sanitizer_stoptheworld.h for details.
++// This implementation was inspired by Markus Gutschke's linuxthreads.cc.
++//
++//===----------------------------------------------------------------------===//
++
++#include "sanitizer_platform.h"
++
++#if SANITIZER_FREEBSD && (defined(__i386__) || defined(__x86_64__))
++
++#include "sanitizer_stoptheworld.h"
++
++#include "sanitizer_platform_limits_posix.h"
++#include "sanitizer_atomic.h"
++
++#include <errno.h>
++#include <stddef.h>
++#include <sys/types.h> // for pid_t
++#include <sys/ptrace.h> // for PTRACE_* definitions
++#include <sys/thr.h>
++#include <sys/wait.h> // for signal-related stuff
++#include <link.h>
++#include <pthread.h>
++#include <unistd.h> // for rfork
++
++#ifdef sa_handler
++# undef sa_handler
++#endif
++
++#ifdef sa_sigaction
++# undef sa_sigaction
++#endif
++
++#include "sanitizer_common.h"
++#include "sanitizer_flags.h"
++#include "sanitizer_libc.h"
++#include "sanitizer_linux.h"
++#include "sanitizer_mutex.h"
++#include "sanitizer_placement_new.h"
++
++// This module works by forking a tracer process that shares the address space
++// with the caller process, which subsequently attaches to the caller process
++// with ptrace and suspends all threads within. PTRACE_GETREGS can then be used
++// to obtain their register state. The callback supplied to StopTheWorld() is
++// run in the tracer process while the threads are suspended.
++
++namespace __sanitizer {
++
++class SuspendedThreadsListFreeBSD : public SuspendedThreadsList {
++ public:
++  SuspendedThreadsListFreeBSD() : parent_pid_(-1) { lwp_ids_.reserve(1024); }
++  ~SuspendedThreadsListFreeBSD();
++  bool populate(pid_t pid);
++
++  tid_t GetThreadID(uptr index) const;
++  uptr ThreadCount() const;
++  bool ContainsTid(tid_t thread_id) const;
++
++  PtraceRegistersStatus GetRegistersAndSP(uptr index, 
++		  			  InternalMmapVector<uptr> *buffer,
++                                          uptr *sp) const;
++  uptr RegisterCount() const;
++
++ private:
++  InternalMmapVector<lwpid_t> lwp_ids_;
++  pid_t parent_pid_;
++};
++
++// Structure for passing arguments into the tracer thread.
++struct TracerThreadArgument {
++  StopTheWorldCallback callback;
++  void *callback_argument;
++  uptr parent_pid;
++};
++
++// Size of alternative stack for signal handlers in the tracer thread.
++static const int kHandlerStackSize = 8192;
++
++// This function will be run as a cloned task.
++static int TracerThread(void* argument) {
++  TracerThreadArgument *tracer_thread_argument =
++      (TracerThreadArgument *)argument;
++
++  SuspendedThreadsListFreeBSD suspended_threads_list;
++
++  if (suspended_threads_list.populate(tracer_thread_argument->parent_pid))
++    tracer_thread_argument->callback(suspended_threads_list,
++                                     tracer_thread_argument->callback_argument);
++
++  return 0;
++}
++
++class ScopedStackSpaceWithGuard {
++ public:
++  explicit ScopedStackSpaceWithGuard(uptr stack_size) {
++    stack_size_ = stack_size;
++    guard_size_ = GetPageSizeCached();
++    // FIXME: Omitting MAP_STACK here works in current kernels but might break
++    // in the future.
++    guard_start_ = (uptr)MmapOrDie(stack_size_ + guard_size_,
++                                   "ScopedStackWithGuard");
++    CHECK(MprotectNoAccess((uptr)guard_start_, guard_size_));
++  }
++  ~ScopedStackSpaceWithGuard() {
++    UnmapOrDie((void *)guard_start_, stack_size_ + guard_size_);
++  }
++  void *Bottom() const {
++    return (void *)(guard_start_ + stack_size_ + guard_size_);
++  }
++
++ private:
++  uptr stack_size_;
++  uptr guard_size_;
++  uptr guard_start_;
++};
++
++// When sanitizer output is being redirected to file (i.e. by using log_path),
++// the tracer should write to the parent's log instead of trying to open a new
++// file. Alert the logging code to the fact that we have a tracer.
++struct ScopedSetTracerPID {
++  explicit ScopedSetTracerPID(uptr tracer_pid) {
++    stoptheworld_tracer_pid = tracer_pid;
++    stoptheworld_tracer_ppid = internal_getpid();
++  }
++  ~ScopedSetTracerPID() {
++    stoptheworld_tracer_pid = 0;
++    stoptheworld_tracer_ppid = 0;
++  }
++};
++
++void StopTheWorld(StopTheWorldCallback callback, void *argument) {
++  // Prepare the arguments for TracerThread.
++  struct TracerThreadArgument tracer_thread_argument;
++  tracer_thread_argument.callback = callback;
++  tracer_thread_argument.callback_argument = argument;
++  tracer_thread_argument.parent_pid = internal_getpid();
++  const uptr kTracerStackSize = 2 * 1024 * 1024;
++  ScopedStackSpaceWithGuard tracer_stack(kTracerStackSize);
++
++  uptr tracer_pid = rfork_thread(RFPROC | RFMEM, tracer_stack.Bottom(),
++                                 TracerThread, &tracer_thread_argument);
++  int local_errno = 0;
++  if (internal_iserror(tracer_pid, &local_errno)) {
++    VReport(1, "Failed spawning a tracer thread (errno %d).\n", local_errno);
++  } else {
++    //ScopedSetTracerPID scoped_set_tracer_pid(tracer_pid);
++    for (;;) {
++      int status;
++      uptr waitpid_status = internal_waitpid(tracer_pid, &status, 0);
++      if (internal_iserror(waitpid_status, &local_errno)) {
++        if (local_errno == EINTR)
++          continue;
++        VReport(1, "Waiting on the tracer thread failed (errno %d).\n",
++                local_errno);
++        break;
++      }
++      if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
++        internal__exit(WEXITSTATUS(status));
++      if (WIFEXITED(status))
++        break;
++    }
++  }
++}
++
++// Platform-specific methods from SuspendedThreadsList.
++#if defined(__i386__) || defined(__x86_64__)
++typedef reg regs_struct;
++#if defined(__i386__)
++#define REG_SP r_esp
++#else
++#define REG_SP r_rsp
++#endif
++#else
++#error "Unsupported architecture"
++#endif
++
++SuspendedThreadsListFreeBSD::~SuspendedThreadsListFreeBSD() {
++  stoptheworld_tracer_pid = 0;
++  stoptheworld_tracer_ppid = 0;
++
++  if (parent_pid_ < 0)
++    return;
++
++  int local_errno = 0;
++  if (internal_iserror(internal_ptrace(PT_DETACH, parent_pid_, 0, 0),
++                       &local_errno)) {
++    VReport(1, "Failed to detach the parent.\n");
++  }
++}
++
++bool SuspendedThreadsListFreeBSD::populate(pid_t pid) {
++  stoptheworld_tracer_pid = internal_getpid();
++  stoptheworld_tracer_ppid = pid;
++
++  int local_errno = 0;
++  if (internal_iserror(internal_ptrace(PT_ATTACH, pid, 0, 0),
++                       &local_errno)) {
++    VReport(1, "Failed to attach the parent.\n");
++    return false;
++  }
++
++  parent_pid_ = pid;
++
++  // wait for the parent process to stop
++  for (;;) {
++    int status;
++    if (internal_iserror(internal_waitpid(pid, &status, 0),
++                         &local_errno)) {
++      if (local_errno == EINTR)
++        continue;
++      VReport(1, "Failed to stop the parent (errno %d).\n", local_errno);
++      return false;
++    }
++    if (WIFSTOPPED(status))
++      break;
++  }
++
++  uptr lwp_count = internal_ptrace(PT_GETNUMLWPS, pid, 0, 0);
++  if (internal_iserror(lwp_count, &local_errno)) {
++      VReport(1, "Failed to get LWP count (errno %d).\n", local_errno);
++      return false;
++  }
++
++  lwp_ids_.resize(lwp_count);
++  if (internal_iserror(internal_ptrace(PT_GETLWPLIST, pid,
++                       lwp_ids_.data(), (void*)lwp_ids_.size()),
++                       &local_errno)) {
++      lwp_ids_.clear();
++      VReport(1, "Failed to get LWP list (errno %d).\n", local_errno);
++      return false;
++  }
++
++  return true;
++}
++
++tid_t SuspendedThreadsListFreeBSD::GetThreadID(uptr index) const {
++  CHECK_LT(index, lwp_ids_.size());
++  return lwp_ids_[index];
++}
++
++uptr SuspendedThreadsListFreeBSD::ThreadCount() const {
++  return lwp_ids_.size();
++}
++
++bool SuspendedThreadsListFreeBSD::ContainsTid(tid_t thread_id) const {
++  lwpid_t lwp_id = (lwpid_t)thread_id;
++  for (uptr i = 0; i < lwp_ids_.size(); i++) {
++    if (lwp_ids_[i] == lwp_id) return true;
++  }
++  return false;
++}
++
++PtraceRegistersStatus SuspendedThreadsListFreeBSD::GetRegistersAndSP(
++    uptr index, InternalMmapVector<uptr> *buffer, uptr *sp) const {
++  int tid = GetThreadID(index);
++  regs_struct regs;
++  int pterrno;
++  bool isErr = internal_iserror(internal_ptrace(PT_GETREGS, tid,
++                                (caddr_t)&regs, 0), &pterrno);
++  if (isErr) {
++    VReport(1, "Could not get registers from thread %d (errno %d).\n", tid,
++            pterrno);
++    // ESRCH means that the given thread is not suspended or already dead.
++    // Therefore it's unsafe to inspect its data (e.g. walk through stack) and
++    // we should notify caller about this.
++    return pterrno == ESRCH ? REGISTERS_UNAVAILABLE_FATAL
++                            : REGISTERS_UNAVAILABLE;
++  }
++
++  *sp = regs.REG_SP;
++  buffer->resize(RoundUpTo(sizeof(regs), sizeof(uptr)) / sizeof(uptr));
++  internal_memcpy(buffer->data(), &regs, sizeof(regs));
++  return REGISTERS_AVAILABLE;
++}
++
++uptr SuspendedThreadsListFreeBSD::RegisterCount() const {
++  return sizeof(regs_struct) / sizeof(uptr);
++}
++} // namespace __sanitizer
++
++#endif
+diff --git a/lib/libclang_rt/asan/Makefile b/lib/libclang_rt/asan/Makefile
+index 149130e3c5f..139a62f483d 100644
+--- a/lib/libclang_rt/asan/Makefile
++++ b/lib/libclang_rt/asan/Makefile
+@@ -30,6 +30,8 @@ SRCS+=		asan/asan_suppressions.cpp
+ SRCS+=		asan/asan_thread.cpp
+ SRCS+=		interception/interception_linux.cpp
+ SRCS+=		interception/interception_type_test.cpp
++SRCS+=		lsan/lsan_common.cpp
++SRCS+=		lsan/lsan_common_linux.cpp
+ SRCS+=		sanitizer_common/sancov_flags.cpp
+ SRCS+=		sanitizer_common/sanitizer_allocator.cpp
+ SRCS+=		sanitizer_common/sanitizer_allocator_checks.cpp
+@@ -62,6 +64,7 @@ SRCS+=		sanitizer_common/sanitizer_stackdepot.cpp
+ SRCS+=		sanitizer_common/sanitizer_stacktrace.cpp
+ SRCS+=		sanitizer_common/sanitizer_stacktrace_libcdep.cpp
+ SRCS+=		sanitizer_common/sanitizer_stacktrace_printer.cpp
++SRCS+=		sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
+ SRCS+=		sanitizer_common/sanitizer_suppressions.cpp
+ SRCS+=		sanitizer_common/sanitizer_symbolizer.cpp
+ SRCS+=		sanitizer_common/sanitizer_symbolizer_libbacktrace.cpp
+diff --git a/lib/libclang_rt/asan_dynamic/Makefile b/lib/libclang_rt/asan_dynamic/Makefile
+index 0bc0bd898c3..0639bd67675 100644
+--- a/lib/libclang_rt/asan_dynamic/Makefile
++++ b/lib/libclang_rt/asan_dynamic/Makefile
+@@ -33,6 +33,8 @@ SRCS+=		asan/asan_suppressions.cpp
+ SRCS+=		asan/asan_thread.cpp
+ SRCS+=		interception/interception_linux.cpp
+ SRCS+=		interception/interception_type_test.cpp
++SRCS+=		lsan/lsan_common.cpp
++SRCS+=		lsan/lsan_common_linux.cpp
+ SRCS+=		sanitizer_common/sancov_flags.cpp
+ SRCS+=		sanitizer_common/sanitizer_allocator.cpp
+ SRCS+=		sanitizer_common/sanitizer_allocator_checks.cpp
+@@ -65,6 +67,7 @@ SRCS+=		sanitizer_common/sanitizer_stackdepot.cpp
+ SRCS+=		sanitizer_common/sanitizer_stacktrace.cpp
+ SRCS+=		sanitizer_common/sanitizer_stacktrace_libcdep.cpp
+ SRCS+=		sanitizer_common/sanitizer_stacktrace_printer.cpp
++SRCS+=		sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
+ SRCS+=		sanitizer_common/sanitizer_suppressions.cpp
+ SRCS+=		sanitizer_common/sanitizer_symbolizer.cpp
+ SRCS+=		sanitizer_common/sanitizer_symbolizer_libbacktrace.cpp
+diff --git a/lsan.diff b/lsan.diff
+new file mode 100644
+index 00000000000..642c3987b80
+--- /dev/null
++++ b/lsan.diff
+@@ -0,0 +1,93 @@
++diff --git a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h
++index 3434beede828..ad301b78ab46 100644
++--- a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h
+++++ b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common.h
++@@ -40,7 +40,7 @@
++ #elif defined(__arm__) && \
++     SANITIZER_LINUX && !SANITIZER_ANDROID
++ #define CAN_SANITIZE_LEAKS 1
++-#elif SANITIZER_NETBSD || SANITIZER_FUCHSIA
+++#elif SANITIZER_NETBSD || SANITIZER_FREEBSD || SANITIZER_FUCHSIA
++ #define CAN_SANITIZE_LEAKS 1
++ #else
++ #define CAN_SANITIZE_LEAKS 0
++diff --git a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp
++index c97ef31593df..c18908b306e0 100644
++--- a/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp
+++++ b/contrib/llvm-project/compiler-rt/lib/lsan/lsan_common_linux.cpp
++@@ -15,7 +15,7 @@
++ #include "sanitizer_common/sanitizer_platform.h"
++ #include "lsan_common.h"
++ 
++-#if CAN_SANITIZE_LEAKS && (SANITIZER_LINUX || SANITIZER_NETBSD)
+++#if CAN_SANITIZE_LEAKS && (SANITIZER_LINUX || SANITIZER_NETBSD || SANITIZER_FREEBSD)
++ #include <link.h>
++ 
++ #include "sanitizer_common/sanitizer_common.h"
++@@ -80,7 +80,11 @@ static int ProcessGlobalRegionsCallback(struct dl_phdr_info *info, size_t size,
++                                         void *data) {
++   Frontier *frontier = reinterpret_cast<Frontier *>(data);
++   for (uptr j = 0; j < info->dlpi_phnum; j++) {
+++#if SANITIZER_FREEBSD
+++    const __ElfN(Phdr) *phdr = &(info->dlpi_phdr[j]);
+++#else
++     const ElfW(Phdr) *phdr = &(info->dlpi_phdr[j]);
+++#endif
++     // We're looking for .data and .bss sections, which reside in writeable,
++     // loadable segments.
++     if (!(phdr->p_flags & PF_W) || (phdr->p_type != PT_LOAD) ||
++@@ -137,7 +141,12 @@ static int LockStuffAndStopTheWorldCallback(struct dl_phdr_info *info,
++ void LockStuffAndStopTheWorld(StopTheWorldCallback callback,
++                               CheckForLeaksParam *argument) {
++   DoStopTheWorldParam param = {callback, argument};
+++#if SANITIZER_FREEBSD
+++  // The tracer is a separate process, phdr deadlock is not a concern
+++  LockStuffAndStopTheWorldCallback(0, 0, &param);
+++#else
++   dl_iterate_phdr(LockStuffAndStopTheWorldCallback, &param);
+++#endif
++ }
++ 
++ } // namespace __lsan
++diff --git a/lib/libclang_rt/asan/Makefile b/lib/libclang_rt/asan/Makefile
++index 647012e8649f..8f028f522ab8 100644
++--- a/lib/libclang_rt/asan/Makefile
+++++ b/lib/libclang_rt/asan/Makefile
++@@ -30,6 +30,8 @@ SRCS+=		asan/asan_suppressions.cpp
++ SRCS+=		asan/asan_thread.cpp
++ SRCS+=		interception/interception_linux.cpp
++ SRCS+=		interception/interception_type_test.cpp
+++SRCS+=		lsan/lsan_common.cpp
+++SRCS+=		lsan/lsan_common_linux.cpp
++ SRCS+=		sanitizer_common/sancov_flags.cpp
++ SRCS+=		sanitizer_common/sanitizer_allocator.cpp
++ SRCS+=		sanitizer_common/sanitizer_allocator_checks.cpp
++@@ -60,6 +62,7 @@ SRCS+=		sanitizer_common/sanitizer_stackdepot.cpp
++ SRCS+=		sanitizer_common/sanitizer_stacktrace.cpp
++ SRCS+=		sanitizer_common/sanitizer_stacktrace_libcdep.cpp
++ SRCS+=		sanitizer_common/sanitizer_stacktrace_printer.cpp
+++SRCS+=		sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
++ SRCS+=		sanitizer_common/sanitizer_suppressions.cpp
++ SRCS+=		sanitizer_common/sanitizer_symbolizer.cpp
++ SRCS+=		sanitizer_common/sanitizer_symbolizer_libbacktrace.cpp
++diff --git a/lib/libclang_rt/asan_dynamic/Makefile b/lib/libclang_rt/asan_dynamic/Makefile
++index 434b1c3c3ed6..90de9496b518 100644
++--- a/lib/libclang_rt/asan_dynamic/Makefile
+++++ b/lib/libclang_rt/asan_dynamic/Makefile
++@@ -33,6 +33,8 @@ SRCS+=		asan/asan_suppressions.cpp
++ SRCS+=		asan/asan_thread.cpp
++ SRCS+=		interception/interception_linux.cpp
++ SRCS+=		interception/interception_type_test.cpp
+++SRCS+=		lsan/lsan_common.cpp
+++SRCS+=		lsan/lsan_common_linux.cpp
++ SRCS+=		sanitizer_common/sancov_flags.cpp
++ SRCS+=		sanitizer_common/sanitizer_allocator.cpp
++ SRCS+=		sanitizer_common/sanitizer_allocator_checks.cpp
++@@ -63,6 +65,7 @@ SRCS+=		sanitizer_common/sanitizer_stackdepot.cpp
++ SRCS+=		sanitizer_common/sanitizer_stacktrace.cpp
++ SRCS+=		sanitizer_common/sanitizer_stacktrace_libcdep.cpp
++ SRCS+=		sanitizer_common/sanitizer_stacktrace_printer.cpp
+++SRCS+=		sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
++ SRCS+=		sanitizer_common/sanitizer_suppressions.cpp
++ SRCS+=		sanitizer_common/sanitizer_symbolizer.cpp
++ SRCS+=		sanitizer_common/sanitizer_symbolizer_libbacktrace.cpp
