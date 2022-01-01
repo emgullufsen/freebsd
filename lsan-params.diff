@@ -1,0 +1,33 @@
+diff --git a/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp b/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
+index a9f5c24967e..f6a7452b10d 100644
+--- a/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
++++ b/contrib/llvm-project/compiler-rt/lib/sanitizer_common/sanitizer_stoptheworld_freebsd.cpp
+@@ -64,7 +64,8 @@ class SuspendedThreadsListFreeBSD : public SuspendedThreadsList {
+   uptr ThreadCount() const;
+   bool ContainsTid(tid_t thread_id) const;
+ 
+-  PtraceRegistersStatus GetRegistersAndSP(uptr index, uptr *buffer,
++  PtraceRegistersStatus GetRegistersAndSP(uptr index, 
++		  			  InternalMmapVector<uptr> *buffer,
+                                           uptr *sp) const;
+   uptr RegisterCount() const;
+ 
+@@ -258,7 +259,7 @@ bool SuspendedThreadsListFreeBSD::ContainsTid(tid_t thread_id) const {
+ }
+ 
+ PtraceRegistersStatus SuspendedThreadsListFreeBSD::GetRegistersAndSP(
+-    uptr index, uptr *buffer, uptr *sp) const {
++    uptr index, InternalMmapVector<uptr> *buffer, uptr *sp) const {
+   int tid = GetThreadID(index);
+   regs_struct regs;
+   int pterrno;
+@@ -275,7 +276,8 @@ PtraceRegistersStatus SuspendedThreadsListFreeBSD::GetRegistersAndSP(
+   }
+ 
+   *sp = regs.REG_SP;
+-  internal_memcpy(buffer, &regs, sizeof(regs));
++  buffer->resize(RoundUpTo(sizeof(regs), sizeof(uptr)) / sizeof(uptr));
++  internal_memcpy(buffer->data(), &regs, sizeof(regs));
+   return REGISTERS_AVAILABLE;
+ }
+ 
