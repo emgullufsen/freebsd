@@ -64,7 +64,8 @@ class SuspendedThreadsListFreeBSD : public SuspendedThreadsList {
   uptr ThreadCount() const;
   bool ContainsTid(tid_t thread_id) const;
 
-  PtraceRegistersStatus GetRegistersAndSP(uptr index, uptr *buffer,
+  PtraceRegistersStatus GetRegistersAndSP(uptr index, 
+		  			  InternalMmapVector<uptr> *buffer,
                                           uptr *sp) const;
   uptr RegisterCount() const;
 
@@ -275,6 +276,7 @@ PtraceRegistersStatus SuspendedThreadsListFreeBSD::GetRegistersAndSP(
   }
 
   *sp = regs.REG_SP;
+  buffer->resize(RoundUpTo(sizeof(regs), sizeof(uptr)) / sizeof(uptr));
   internal_memcpy(buffer->data(), &regs, sizeof(regs));
   return REGISTERS_AVAILABLE;
 }
