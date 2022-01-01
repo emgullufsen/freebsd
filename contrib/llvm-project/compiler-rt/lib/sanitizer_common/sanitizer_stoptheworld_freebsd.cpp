@@ -258,7 +258,7 @@ bool SuspendedThreadsListFreeBSD::ContainsTid(tid_t thread_id) const {
 }
 
 PtraceRegistersStatus SuspendedThreadsListFreeBSD::GetRegistersAndSP(
-    uptr index, uptr *buffer, uptr *sp) const {
+    uptr index, InternalMmapVector<uptr> *buffer, uptr *sp) const {
   int tid = GetThreadID(index);
   regs_struct regs;
   int pterrno;
@@ -275,7 +275,7 @@ PtraceRegistersStatus SuspendedThreadsListFreeBSD::GetRegistersAndSP(
   }
 
   *sp = regs.REG_SP;
-  internal_memcpy(buffer, &regs, sizeof(regs));
+  internal_memcpy(buffer->data(), &regs, sizeof(regs));
   return REGISTERS_AVAILABLE;
 }
 
