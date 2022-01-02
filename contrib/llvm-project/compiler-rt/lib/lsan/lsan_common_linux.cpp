@@ -15,7 +15,7 @@
 #include "sanitizer_common/sanitizer_platform.h"
 #include "lsan_common.h"
 
-#if CAN_SANITIZE_LEAKS && (SANITIZER_LINUX || SANITIZER_NETBSD)
+#if CAN_SANITIZE_LEAKS && (SANITIZER_LINUX || SANITIZER_NETBSD || SANITIZER_FREEBSD)
 #include <link.h>
 
 #include "sanitizer_common/sanitizer_common.h"
@@ -80,7 +80,11 @@ static int ProcessGlobalRegionsCallback(struct dl_phdr_info *info, size_t size,
                                         void *data) {
   Frontier *frontier = reinterpret_cast<Frontier *>(data);
   for (uptr j = 0; j < info->dlpi_phnum; j++) {
+#if SANITIZER_FREEBSD
+    const __ElfN(Phdr) *phdr = &(info->dlpi_phdr[j]);
+#else
     const ElfW(Phdr) *phdr = &(info->dlpi_phdr[j]);
+#endif
     // We're looking for .data and .bss sections, which reside in writeable,
     // loadable segments.
     if (!(phdr->p_flags & PF_W) || (phdr->p_type != PT_LOAD) ||
@@ -142,7 +146,11 @@ static int LockStuffAndStopTheWorldCallback(struct dl_phdr_info *info,
 void LockStuffAndStopTheWorld(StopTheWorldCallback callback,
                               CheckForLeaksParam *argument) {
   DoStopTheWorldParam param = {callback, argument};
+#if SANITIZER_FREEBSD
+  LockStuffAndStopTheWorldCallback(0, 0, &param);
+#else
   dl_iterate_phdr(LockStuffAndStopTheWorldCallback, &param);
+#endif
 }
 
 } // namespace __lsan
